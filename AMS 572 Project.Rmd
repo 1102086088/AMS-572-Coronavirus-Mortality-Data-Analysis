@@ -1,0 +1,362 @@
+---
+title: "AMS 572 Project"
+author: "Group 2"
+date: "11/18/2021"
+output: word_document
+---
+
+Import Packages
+```{r}
+library(dplyr)
+library(psych)
+library(mice)
+library(leaps)
+library(tidyverse)
+library(MASS)
+library(caret)
+library(caret)
+library(knitr)
+library(pROC)
+```
+Load Data
+```{r}
+# Data Provided by CDC Case Surveillance Task Force
+# Reference: https://data.cdc.gov/Case-Surveillance/COVID-19-Case-Surveillance-Public-Use-Data-with-Ge/n8mc-b4w4
+data.original <- read.csv("COVID-19_Case_Surveillance_Public_Use_Data_with_Geography.csv")
+data.original <- data.original[sample(nrow(data.original), 100000), ]
+
+# Convert "Unknown" and "Missing" character values into NA
+data.original[data.original == "Unknown"] <- NA 
+data.original[data.original == "Missing"] <- NA
+data.original[data.original == ""] <- NA
+
+# The number of missing values
+sum(is.na(data.original))
+```
+Process Reported Data Set
+```{r}
+# Data Provided by National Center for Health Statistics
+# Reference: https://data.cdc.gov/NCHS/Provisional-COVID-19-Deaths-by-Sex-and-Age/9bhg-hcku
+data.reported <- read.csv("Provisional_COVID-19_Deaths_by_Sex_and_Age.csv")
+data.reported <- data.reported[c(3, 7, 9, 11, 13, 15, 16, 17), ]
+
+for (i in rownames(data.reported)) {
+  if (data.reported[i, "Age.Group"] == "18-29 years" |
+           data.reported[i, "Age.Group"] == "30-39 years" |
+           data.reported[i, "Age.Group"] == "40-49 years") {
+    data.reported[i, "Age.Group"] = "18 to 49 years"
+  }
+  else if (data.reported[i, "Age.Group"] == "65-74 years" |
+           data.reported[i, "Age.Group"] == "75-84 years" |
+           data.reported[i, "Age.Group"] == "85 years and over") {
+    data.reported[i, "Age.Group"] = "65+ years"
+  }
+}
+
+data.reported <- summarise(group_by(data.reported, Age.Group), 
+                           COVID.19.Deaths = sum(COVID.19.Deaths, na.rm = TRUE), 
+                           Death.Proportion = COVID.19.Deaths / sum(data.reported$COVID.19.Deaths))
+
+# Death proportion for each age group
+prop.reported <- c(data.reported$Death.Proportion)
+```
+
+Part 1 : Do Not Generate Missing Values
+  Copy Data but Do Not Generate Missing Values
+```{r}
+data.inc <- data.original
+```
+  First Hypothesis: Are the reported death proportion for varying age groups accurate?
+```{r}
+# The number of missing values in "death_yn" column
+length(which(is.na(data.inc$death_yn)))
+# The numver of missing values in "age_group" column
+length(which(is.na(data.inc$age_group)))
+
+# Group data set by "age_group" variable
+data.table <- summarise(group_by(data.inc, age_group), 
+                        Death = length(which(death_yn == "Yes")), 
+                        Survive = length(which(death_yn == "No")), 
+                        Total = sum(Death, Survive))
+# Delete NA group
+data.table <- data.table[-5, ]
+
+# Perform the chi-square test
+# Null Hypothesis: the reported death proportion is accurate
+# Alternative Hypothesis: the reported death proportion is inaccurate
+obs <- data.table$Death
+chisq.test(obs, prop.reported)
+# According to the result of the test, we are not able to reject the null hypothesis since p-value is around 0.2. Hence, the reported death proportion for each age group from NCHS can be supported by the surveillance data from CDC Case Surveillance Task Force.
+```
+  Second Hypothesis: Are age group, sex, race, etc. significant predictors of COVID-19 death?
+```{r}
+# Pick variables can be used to build a logistic regression model
+data.inc <- data.inc[ , c("age_group", "sex", "race", "symptom_status", "hosp_yn", "icu_yn", "death_yn")]
+
+# To deal with character value to factor 
+data.inc$age_group <- as.factor(data.inc$age_group)
+data.inc$sex <- as.factor(data.inc$sex)
+data.inc$race <- as.factor(data.inc$race)
+data.inc$symptom_status <- as.factor(data.inc$symptom_status)
+data.inc$hosp_yn <- as.factor(data.inc$hosp_yn)
+data.inc$icu_yn <- as.factor(data.inc$icu_yn)
+data.inc$death_yn <- as.factor(data.inc$death_yn)
+
+# Statistics for data.inc
+str(data.inc) # the number of observations before deleting all missing values
+summary(data.inc)
+sum(is.na(data.inc))
+
+# Delete all missing values
+data.inc <- data.inc[complete.cases(data.inc), ]
+str(data.inc) # the number of observations after deleting all missing values
+
+# Separate data set into training set and test set
+split <- data.inc$death_yn %>% createDataPartition(p = 0.80, list = FALSE) 
+train <- data.inc[split, ]
+test <- data.inc[-split, ]
+str(train) # the number of observations in training set
+str(test) # the number of observations in test set
+
+# Build a logistic regression model
+M.raw <- glm(death_yn ~ (.), family = binomial("logit"), data = train)
+summary(M.raw)
+
+# Using step wise method to find the best model
+step.model <- step(M.raw, direction = "both", trace = FALSE)
+summary(step.model)
+# According to the result of summary(step.model), the p-values for variables "hosp_yn", and "icu_yn" are very close to 0. Hence, we decide to put these two variables in our final model.
+# Since we have demonstrated that the death proportion calculated from the reported data is accurate, there must be significant differences among four groups. Hence, we decide to put the variable "age_group" in our final model.
+
+# Final model
+M.final <- glm(death_yn ~ (age_group + hosp_yn + icu_yn), family = binomial("logit"), data = train)
+summary(M.final)
+
+# According to the data from Johns Hopkins Coronavirus Resourse Center, the case fatality rate in the United States is 1.6%
+# Reference: https://coronavirus.jhu.edu/data/mortality
+# Test if reported case fatality rate is accurate
+total <- sum(data.table$Total)
+death.total <- sum(data.table$Death)
+prop.test(death.total, total, 0.016)
+# Since p-value is very close to 0, we are able to reject the null hypothesis. Therefore, the fatality rate is inaccurate. Hence, we decide to use the fatality rate from the data set instead of reported fatality rate.
+rate <- death.total / total
+
+# Make prediction
+prob = predict(M.final, test, type = "response")
+pred = ifelse(prob > rate, 1, 0)
+
+# Confusion matrix
+table(test$death_yn, pred)
+
+# Sensitivity vs. Specificity
+modelroc <- roc(test$death_yn, pred)
+plot(modelroc, 
+     print.auc = TRUE, 
+     auc.polygon = TRUE, 
+     grid = c(0.1, 0.2),
+     grid.col = c("green", "red"), 
+     max.auc.polygon = TRUE,
+     auc.polygon.col = "skyblue", 
+     print.thres = TRUE)
+```
+
+Part 2 : Generate Missing Values
+  Process Data Set that Assists in Generating Missing Values
+```{r}
+# Data Provided by CDC
+# Reference: https://covid.cdc.gov/covid-data-tracker/#demographics
+case.assist <- read.csv("cases_by_age_group.csv", header = TRUE, skip = 2)
+death.assist <- read.csv("deaths_by_age_group.csv", header = TRUE, skip = 2)
+data.assist <- merge(case.assist, death.assist, by = "Age.Group")
+
+data.assist[data.assist == "<0.1"] <- 0.3 / 4
+data.assist[ , "Percentage.of.deaths"] <- as.numeric(data.assist[ , "Percentage.of.deaths"])
+
+for (i in rownames(data.assist)) {
+  if (data.assist[i, "Age.Group"] == "0-4 Years" |
+      data.assist[i, "Age.Group"] == "5-11 Years" |
+      data.assist[i, "Age.Group"] == "12-15 Years" |
+      data.assist[i, "Age.Group"] == "16-17 Years" ) {
+    data.assist[i, "Age.Group"] = "0 - 17 years"
+  }
+  else if (data.assist[i, "Age.Group"] == "18-29 Years" |
+           data.assist[i, "Age.Group"] == "30-39 Years" |
+           data.assist[i, "Age.Group"] == "40-49 Years") {
+    data.assist[i, "Age.Group"] = "18 to 49 years"
+  }
+  else if (data.assist[i, "Age.Group"] == "65-74 Years" |
+           data.assist[i, "Age.Group"] == "75-84 Years" |
+           data.assist[i, "Age.Group"] == "85+ Years") {
+    data.assist[i, "Age.Group"] = "65+ years"
+  }
+  else {
+    data.assist[i, "Age.Group"] = "50 to 64 years"
+  }
+}
+
+data.assist <- summarise(group_by(data.assist, Age.Group), 
+                           Percent.of.cases = sum(Percent.of.cases, na.rm = TRUE) / 100, 
+                           Count.of.cases = sum(Count.of.cases, na.rm = TRUE), 
+                           Percentage.of.deaths = sum(Percentage.of.deaths, na.rm = TRUE) / 100, 
+                           Count.of.deaths = sum(Count.of.deaths, na.rm = TRUE),
+                           Case.fatality.rate = Count.of.deaths / Count.of.cases)
+
+# According to the result, the proportion of infection for "0 - 17 years" is 15.2%, the proportion of infection for "18 to 49 years" is 52.9%, the proportion of infection for "50 to 64 years" is 19.2%, and the proportion of infection for "65+ years" is 12.8%.
+infection.rate <- c(data.assist$Percent.of.cases)
+
+# According to the result, the death rate for "0 - 17 years" is 0.016%, the death rate for "18 to 49 years" is 0.193%, the death rate for "50 to 64 years" is 1.472%, and the death rate for "65+ years" is 10.101%.
+death.rate <- c(data.assist$Case.fatality.rate)
+```
+  Copy Data
+```{r}
+data.imp <- data.original
+```
+  Generate MNAR
+```{r}
+# The number of missing values in columns, "age_group" and "death_yn" before generating missing values.
+length(rownames(data.imp[is.na(data.imp$age_group), ]))
+length(rownames(data.imp[is.na(data.imp$death_yn), ]))
+length(rownames(data.imp[is.na(data.imp$underlying_conditions_yn), ]))
+
+# According to previous result, the proportion of infection for "0 - 17 years" is 15.2%, the proportion of infection for "18 to 49 years" is 52.9%, the proportion of infection for "50 to 64 years" is 19.2%, and the proportion of infection for "65+ years" is 12.8%.
+for (individual in rownames(data.imp[is.na(data.imp$age_group), ])) {
+  data.imp[individual, "age_group"] = sample(c("0 - 17 years", "18 to 49 years", "50 to 64 years", "65+ years"), 1, prob = infection.rate)
+}
+
+# According to previous result, the death rate for "0 - 17 years" is 0.016%, the death rate for "18 to 49 years" is 0.193%, the death rate for "50 to 64 years" is 1.472%, and the death rate for "65+ years" is 10.101%.
+for (individual in rownames(data.imp[is.na(data.imp$death_yn), ])) {
+  if (data.imp[individual, "age_group"] == "0 - 17 years") {
+    x <- runif(1)
+    if (x < death.rate[1]) {
+      data.imp[individual, "death_yn"] = "Yes"
+    }
+    else {
+      data.imp[individual, "death_yn"] = "No"
+    }
+  }
+  else if (data.imp[individual, "age_group"] == "18 to 49 years") {
+    x <- runif(1)
+    if (x < death.rate[2]) {
+      data.imp[individual, "death_yn"] = "Yes"
+    }
+    else {
+      data.imp[individual, "death_yn"] = "No"
+    }
+  }
+  else if (data.imp[individual, "age_group"] == "50 to 64 years") {
+    x <- runif(1)
+    if (x < death.rate[3]) {
+      data.imp[individual, "death_yn"] = "Yes"
+    }
+    else {
+      data.imp[individual, "death_yn"] = "No"
+    }
+  }
+  else {
+    x <- runif(1)
+    if (x < death.rate[4]) {
+      data.imp[individual, "death_yn"] = "Yes"
+    }
+    else {
+      data.imp[individual, "death_yn"] = "No"
+    }
+  }
+}
+
+# The number of missing values in columns, "age_group" and "death_yn" after generating missing values.
+length(rownames(data.imp[is.na(data.imp$age_group), ]))
+length(rownames(data.imp[is.na(data.imp$death_yn), ]))
+length(rownames(data.imp[is.na(data.imp$underlying_conditions_yn), ]))
+```
+  Generate MCAR
+```{r}
+# Pick variables that can be used in this project
+data.imp <- data.imp[ , c("age_group", "sex", "race", "symptom_status", "hosp_yn", "icu_yn", "death_yn")]
+
+# To deal with character value to factor 
+data.imp$age_group <- as.factor(data.imp$age_group)
+data.imp$sex <- as.factor(data.imp$sex)
+data.imp$race <- as.factor(data.imp$race)
+data.imp$symptom_status <- as.factor(data.imp$symptom_status)
+data.imp$hosp_yn <- as.factor(data.imp$hosp_yn)
+data.imp$icu_yn <- as.factor(data.imp$icu_yn)
+data.imp$death_yn <- as.factor(data.imp$death_yn)
+
+# Applying "mice"
+md.pattern(data.imp)
+imp <- mice(data.imp, method = "pmm", seed = 123) # m = 5
+data.com <- complete(imp)
+
+# Check
+md.pattern(data.com)
+sum(is.na(data.com))
+```
+  First Hypothesis: Are the reported death proportion for varying age groups accurate?
+```{r}
+# Group data set by "age_group" variable
+data.table.com <- summarise(group_by(data.com, age_group), 
+                        Death = length(which(death_yn == "Yes")), 
+                        Survive = length(which(death_yn == "No")), 
+                        Total = sum(Death, Survive))
+
+# Perform the chi-square test
+# Null Hypothesis: the reported death proportion is accurate
+# Alternative Hypothesis: the reported death proportion is inaccurate
+obs.com <- data.table.com$Death
+chisq.test(obs.com, prop.reported)
+# According to the result of the test, we are not able to reject the null hypothesis since p-value is around 0.2. Hence, the reported death proportion for each age group from NCHS can be supported by the surveillance data from CDC Case Surveillance Task Force.
+```
+  Second Hypothesis: Are age group, sex, race, etc. significant predictors of COVID-19 death?
+```{r}
+# Statistics for data.inc
+str(data.com) # the number of observations before deleting all missing values
+summary(data.com)
+sum(is.na(data.com))
+
+# Separate data set into training set and test set
+split.com <- data.com$death_yn %>% createDataPartition(p = 0.80, list = FALSE) 
+train.com <- data.com[split.com, ]
+test.com <- data.com[-split.com, ]
+str(train.com) # the number of observations in training set
+str(test.com) # the number of observations in test set
+
+# Build a logistic regression model
+M.raw.com <- glm(death_yn ~ (.), family = binomial("logit"), data = train.com)
+summary(M.raw.com)
+
+# Using step wise method to find the best model
+step.model.com <- step(M.raw.com, direction = "both", trace = FALSE)
+summary(step.model.com)
+# According to the result of summary(step.model), the p-values for variables "sex", "hosp_yn", and "icu_yn" are very close to 0. Hence, we decide to put these three variables in our final model.
+# Since we have demonstrated that the death proportion calculated from the reported data is accurate, there must be significant differences among four groups. Hence, we decide to put the variable "age_group" in our final model.
+
+# Final model
+M.final.com <- glm(death_yn ~ (age_group + sex + hosp_yn + icu_yn), family = binomial("logit"), data = train.com)
+summary(M.final.com)
+
+# According to the data from Johns Hopkins Coronavirus Resourse Center, the case fatality rate in the United States is 1.6%
+# Reference: https://coronavirus.jhu.edu/data/mortality
+# Test if reported case fatality rate is accurate
+total.com <- sum(data.table.com$Total)
+death.total.com <- sum(data.table.com$Death)
+prop.test(death.total.com, total.com, 0.016)
+# Since p-value is relatively higher, we are not able to reject the null hypothesis. Therefore, the fatality rate is accurate. Hence, we decide to use the reported fatality rate instead of the fatality rate from the data set.
+
+# Make prediction
+prob.com = predict(M.final.com, test.com, type = "response")
+pred.com = ifelse(prob.com > 0.016, 1, 0)
+
+# Confusion matrix
+table(test.com$death_yn, pred.com)
+
+# Sensitivity vs. Specificity
+modelroc.com <- roc(test.com$death_yn, pred.com)
+plot(modelroc.com, 
+     print.auc = TRUE, 
+     auc.polygon = TRUE, 
+     grid = c(0.1, 0.2),
+     grid.col = c("green", "red"), 
+     max.auc.polygon = TRUE,
+     auc.polygon.col = "skyblue", 
+     print.thres = TRUE)
+```
